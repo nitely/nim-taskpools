@@ -1,5 +1,5 @@
 # taskpools
-# Copyright (c) 2021 Status Research & Development GmbH
+# Copyright (c) 2021-2025 Status Research & Development GmbH
 # Licensed and distributed under either of
 #   * MIT license (license terms in the root directory or at http://opensource.org/licenses/MIT).
 #   * Apache v2 license (license terms in the root directory or at http://www.apache.org/licenses/LICENSE-2.0).
@@ -39,29 +39,28 @@
 
 import
   system/ansi_c,
-  std/[random, cpuinfo, atomics, macros],
-  ./channels_spsc_single,
-  ./chase_lev_deques,
-  ./event_notifiers,
+  std/[atomics, cpuinfo, isolation, macros, random, typetraits],
+  ./[
+    ast_utils, channels_spsc_single, chase_lev_deques, event_notifiers, flowvars,
+    sparsesets,
+  ],
   ./primitives/[barriers, allocs],
-  ./instrumentation/[contracts, loggers],
-  ./sparsesets,
-  ./flowvars,
-  ./ast_utils,
-  ./tasks
+  ./instrumentation/[contracts, loggers]
 
 export
   # flowvars
-  Flowvar, isSpawned, isReady, sync, tasks
+  Flowvar, isSpawned, isReady, sync, isolation
 
 
 type
   WorkerID = int32
 
+  TaskCallback = proc(args: pointer) {.nimcall, gcsafe, raises: [].}
   TaskNode = ptr object
     # Linked list of tasks
     parent: TaskNode
-    task: Task
+    callback*: TaskCallback
+    args*: pointer
 
   Signal = object
     terminate {.align: 64.}: Atomic[bool]
@@ -100,6 +99,21 @@ type
     workers: ptr UncheckedArray[Thread[(Taskpool, WorkerID)]]
     workerSignals: ptr UncheckedArray[Signal]
       ## Access signaledTerminate
+
+proc supportsThreadMove*(T: type): bool {.compileTime.} =
+  # Similar to `supportsCopyMem` but allows types with disabled `=copy`. Not
+  # perfect.
+  when T is object | tuple:
+    for f in fields(cast[ptr T](0)[]):
+      if not supportsThreadMove(typeof(f)):
+        return false
+    true
+  elif T is distinct:
+    supportsThreadMove(distinctBase(T))
+  elif T is SomeOrdinal | pointer | ptr | cstring | char | float | float32 | float64:
+    true
+  else: # string | seq | ref | proc | iterator - last two are tricky
+    false
 
 # Thread-local config
 # ---------------------------------------------
@@ -173,19 +187,17 @@ proc workerEntryFn(params: tuple[taskpool: Taskpool, id: WorkerID]) =
 # Tasks
 # ---------------------------------------------
 
-proc new(T: type TaskNode, parent: TaskNode, task: sink Task): T =
+proc new(T: type TaskNode, parent: TaskNode, callback: TaskCallback, args: pointer): T =
   var tn = tp_allocPtr(TaskNode)
   tn.parent = parent
-  wasMoved(tn.task) # tn.task is uninitialized, prevent Nim from running the Task destructor
-  tn.task = task
+  tn.callback = callback
+  tn.args = args
   return tn
 
 proc runTask(tn: var TaskNode) {.inline.} =
   ## Run a task and consumes the taskNode
-  tn.task.invoke()
-  {.gcsafe.}: # Upstream missing tagging `=destroy` as gcsafe
-    tn.task.`=destroy`()
-  tn.c_free()
+  tn.callback(tn.args)
+  tn.tp_free()
 
 proc schedule(ctx: WorkerContext, tn: sink TaskNode) {.inline.} =
   ## Schedule a task in the taskpool
@@ -238,13 +250,14 @@ proc eventLoop(ctx: var WorkerContext) =
 # Tasking
 # ---------------------------------------------
 
-const RootTask = default(Task) # TODO: sentinel value different from null task
+proc RootTask(args: pointer) =
+  discard
 
-template isRootTask(task: Task): bool =
-  task == RootTask
+template isRootTask(task: TaskNode): bool {.used.} =
+  task.callback == RootTask
 
 proc forceFuture*[T](fv: Flowvar[T], parentResult: var T) =
-  ## Eagerly complete an awaited FlowVar
+  ## Eagerly complete an awaited Flowvar
 
   template ctx: untyped = workerContext
 
@@ -298,7 +311,7 @@ proc syncAll*(tp: Taskpool) =
     log(">>> Worker %2d enters barrier <<<\n", ctx.id)
 
   preCondition: ctx.id == 0
-  preCondition: ctx.currentTask.task.isRootTask()
+  preCondition: ctx.currentTask.isRootTask()
 
   # Empty all tasks
   var foreignThreadsParked = false
@@ -364,10 +377,8 @@ proc new*(T: type Taskpool, numThreads = countProcessors()): T {.raises: [Catcha
   setupWorker()
 
   # Root task, this is a sentinel task that is never called.
-  workerContext.currentTask = TaskNode.new(
-    parent = nil,
-    task = default(Task) # TODO RootTask, somehow this uses `=copy`
-  )
+  workerContext.currentTask =
+    TaskNode.new(parent = nil, callback = RootTask, args = nil)
 
   # Wait for the child threads
   discard tp.barrier.wait()
@@ -375,7 +386,7 @@ proc new*(T: type Taskpool, numThreads = countProcessors()): T {.raises: [Catcha
 
 proc cleanup(tp: var Taskpool) =
   ## Cleanup all resources allocated by the taskpool
-  preCondition: workerContext.currentTask.task.isRootTask()
+  preCondition: workerContext.currentTask.isRootTask()
 
   for i in 1 ..< tp.numThreads:
     joinThread(tp.workers[i])
@@ -390,7 +401,7 @@ proc cleanup(tp: var Taskpool) =
 
 proc shutdown*(tp: var Taskpool) =
   ## Wait until all tasks are processed and then shutdown the taskpool
-  preCondition: workerContext.currentTask.task.isRootTask()
+  preCondition: workerContext.currentTask.isRootTask()
   tp.syncAll()
 
   # Signal termination to all threads
@@ -423,87 +434,134 @@ macro spawn*(tp: Taskpool, fnCall: typed): untyped =
   ## `spawn` returns immediately.
   ##
   ## Tasks are processed approximately in Last-In-First-Out (LIFO) order
-  result = newStmtList()
+  fnCall.expectKind(nnkCall)
 
   let fn = fnCall[0]
-  let fnName = $fn
 
-  # Get the return type if any
-  let retType = fnCall[0].getImpl[3][0]
-  let needFuture = retType.kind != nnkEmpty
+  if hasClosure(fn):
+    error("Closure calls cannot be spawned", fnCall)
 
-  # Package in a task
-  let taskNode = ident("taskNode")
-  if not needFuture:
-    result.add quote do:
-      let `taskNode` = TaskNode.new(workerContext.currentTask, toTask(`fnCall`))
-      schedule(workerContext, `taskNode`)
+  let
+    argsTup = nnkTupleConstr.newTree()
+      # Tuple for collecting function arguments and storage for return value
+    fwdCall = nnkCall.newTree(fn)
+      # same as fnCall, but with parameters forwarded from the closure environment
+    env = genSym(nskTemp, "env") # closure environment
 
-  else:
-    # tasks have no return value.
-    # 1. We create a channel/flowvar to transmit the return value to awaiter/sync
-    # 2. We create a wrapper async_fn without return value that send the return value in the channel
-    # 3. We package that wrapper function in a task
+  result = newStmtList()
 
-    # 1. Create the channel
-    let fut = ident("fut")
-    let futTy = nnkBracketExpr.newTree(
-      bindSym"FlowVar",
-      retType
-    )
-    result.add quote do:
-      let `fut` = newFlowVar(type `retType`)
+  # A task is similar to a closure proc but with the closure environment
+  # allocated in shared memory.
+  #
+  # The closure environment is a tuple that holds:
+  #
+  # * runtime parameters, ie those that are not constants / literals / etc
+  # * Flowvar for return value, if any
+  #
+  # Start with the runtime parameters:
+  var j = 0
+  for i in 1 ..< fnCall.len:
+    let p = fnCall[i]
+    if isStatic(p):
+      # Literals can be passed as-is to the callee
+      fwdCall.add p
+    else:
+      # Non-literals must be copied to shared memory - add them to a tuple
+      # then extract them from the tuple on the calling side
+      let jl = newLit(j)
+      j += 1
 
-    # 2. Create a wrapper function that sends result to the channel
-    # TODO, upstream "getImpl" doesn't return the generic params
-    let genericParams = fn.getImpl()[2].replaceSymsByIdents()
-    let formalParams = fn.getImpl()[3].replaceSymsByIdents()
+      when defined(gcOrc) or defined(gcArc):
+        # In ORC, we can isolate values and move them between tasks
+        argsTup.add quote do:
+          isolate(`p`)
+        fwdCall.add quote do:
+          extract(`env`[][`jl`])
+      else:
+        # `move` to support move-only types in refc
+        argsTup.add p
+        let hasClosure = newLit(p.kind == nnkSym and hasClosure(p))
 
-    var asyncParams = nnkFormalParams.newTree(
-      newEmptyNode()
-    )
-    var fnCallIdents = nnkCall.newTree(
-      fnCall[0]
-    )
-    for i in 1 ..< formalParams.len:
-      let ident = formalParams[i].replaceSymsByIdents()
-      asyncParams.add ident
-      for j in 0 ..< ident.len - 2:
-        # Handle "a, b: int"
-        fnCallIdents.add ident[j]
+        # `refc` uses a thread-local heap - therefore, anything heap-allocated
+        # cannot traverse thread boundaries, even if it's isolated - since
+        # tasks are likely to end up on a different thread, block their
+        # construction here.
+        fwdCall.add quote do:
+          when `hasClosure` or not supportsThreadMove(typeof(`p`)):
+            {.
+              error:
+                "Garbage-collected types (seq, string, ref, closures) cannot be used as task arguments: " &
+                $(typeof(`p`))
+            .}
 
-    let futFnParam = ident("fut")
-    asyncParams.add newIdentDefs(futFnParam, futTy)
+          move(`env`[][`jl`])
+  let
+    envp = genSym(nskParam, "envp")
+      # closure environment, untyped pointer version in `fwdCall`
+    retType = fn.getImpl().params()[0]
+    argsTy = genSym(nskType, "ArgsType")
 
-    let asyncBody = quote do:
-      # XXX: can't test that when the RootTask is default(Task) instead of a sentinel value
-      # preCondition: not isRootTask(workerContext.currentTask.task)
+    (fut, body) =
+      if retType.kind != nnkEmpty:
+        # if the call returns a value, create a `Flowvar` which can transfer
+        # the result back to the caller, similar to a Future.
+        #
+        # The Flowvar is added to the argument tuple, similar to the function
+        # arguments.
+        let
+          fut = genSym(nskTemp, "fut")
+          retIdx = newLit(argsTup.len)
 
-      let res = `fnCallIdents`
-      readyWith(`futFnParam`, res)
+          body = quote:
+            let `env` = cast[ptr `argsTy`](`envp`)
+            readyWith(`env`[][`retIdx`], `fwdCall`)
 
-    let asyncFn = ident("taskpool_" & fnName)
-    result.add nnkProcDef.newTree(
-      asyncFn,
-      newEmptyNode(),
-      genericParams,
-      asyncParams,
-      nnkPragma.newTree(ident("nimcall")),
-      newEmptyNode(),
-      asyncBody
-    )
+        argsTup.add fut
 
-    var asyncCall = newCall(asyncFn)
-    for i in 1 ..< fnCall.len:
-      asyncCall.add fnCall[i].replaceSymsByIdents()
-    asyncCall.add fut
+        result.add quote do:
+          let `fut` = newFlowVar(type `retType`)
 
-    result.add quote do:
-      let `taskNode` = TaskNode.new(workerContext.currentTask, toTask(`asyncCall`))
-      schedule(workerContext, `taskNode`)
+        (fut, body)
+      elif argsTup.len > 0:
+        let body = quote:
+          let `env` = cast[ptr `argsTy`](`envp`)
+          `fwdCall`
 
-      # Return the future / flowvar
-      `fut`
+        (newEmptyNode(), body)
+      else:
+        (newEmptyNode(), fwdCall)
+
+    args =
+      if argsTup.len > 0:
+        let args = genSym(nskTemp, "args")
+
+        # Allocate the tuple that will hold the arguments that need to be passed
+        # to the task, potentially on a different thread
+        result.add quote do:
+          type `argsTy` = typeof(`argsTup`)
+          let `args` = createShared(`argsTy`)
+          `args`[] = `argsTup`
+
+        # ... and free it after the task has finished running - because we moved
+        # the values out of the environment when calling the function, there's
+        # nothing left to process
+        body.add quote do:
+          wasMoved(`env`[])
+          freeShared(`env`)
+        args
+      else:
+        newNilLit()
+    taskFn = genSym(nskProc, $fn & "_task")
+      # Function that calls `fn` inside within the taskpool thread
+
+  result.add quote do:
+    proc `taskFn`(`envp`: pointer) {.nimcall, gcsafe, raises: [].} =
+      `body`
+
+    let taskNode = TaskNode.new(workerContext.currentTask, `taskFn`, `args`)
+    schedule(workerContext, taskNode)
+
+    `fut`
 
   # Wrap in a block for namespacing
   result = nnkBlockStmt.newTree(newEmptyNode(), result)
