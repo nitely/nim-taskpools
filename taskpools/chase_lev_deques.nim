@@ -114,7 +114,8 @@ proc grow[T](deque: var ChaseLevDeque[T], buf: var ptr Buf[T], top, bottom: int)
   buf.prev = deque.garbage
   deque.garbage = buf
   # publish globally
-  deque.buf.store(tmp, moRelaxed)
+  # moRelease for buf.load(moConsume) in steal
+  deque.buf.store(tmp, moRelease)
   # publish locally
   swap(buf, tmp)
 
@@ -149,8 +150,14 @@ proc push*[T](deque: var ChaseLevDeque[T], item: T) =
     deque.grow(a, t, b)
 
   a[][b] = item
-  fence(moRelease)
-  deque.bottom.store(b+1, moRelaxed)
+  when defined(taskpoolsTsan):
+    # TSan does not support atomic_thread_fence, see:
+    # https://github.com/llvm/llvm-project/issues/52942
+    # https://github.com/google/sanitizers/issues/1352
+    deque.bottom.store(b+1, moRelease)
+  else:
+    fence(moRelease)
+    deque.bottom.store(b+1, moRelaxed)
 
 proc pop*[T](deque: var ChaseLevDeque[T]): T =
   ## Deque an item at the bottom
