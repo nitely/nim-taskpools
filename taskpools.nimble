@@ -45,13 +45,17 @@ proc runTests(args: string) =
   run args, "examples/e01_simple_tasks.nim"
   run args, "examples/e02_parallel_pi.nim"
 
-  # Benchmarks
+  # Tests
+  run args, "tests/test_all.nim"
+
+task test, "Run tests":
+  for mode in ["", "-d:release", "-d:danger"]:
+    runTests(mode)
+
+proc runBenchs(args: string) =
   run args, "benchmarks/dfs/taskpool_dfs.nim"
   run args, "benchmarks/heat/taskpool_heat.nim"
   run args, "benchmarks/nqueens/taskpool_nqueens.nim"
-
-  # Tests
-  run args, "tests/test_calltypes.nim"
 
   when not defined(windows):
     run args, "benchmarks/single_task_producer/taskpool_spc.nim"
@@ -60,6 +64,6 @@ proc runTests(args: string) =
   # TODO - generics in macro issue
   # run args, "benchmarks/matmul_cache_oblivious/taskpool_matmul_co.nim"
 
-task test, "Run Taskpools tests":
+task test_bench, "Run benchs":
   for mode in ["", "-d:release", "-d:danger"]:
-    runTests(mode)
+    runBenchs(mode)
