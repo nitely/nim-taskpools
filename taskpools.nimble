@@ -44,6 +44,7 @@ proc runTests(args: string) =
   # Examples
   run args, "examples/e01_simple_tasks.nim"
   run args, "examples/e02_parallel_pi.nim"
+  run args, "examples/e03_external_threads.nim"
 
   # Tests
   run args, "tests/test_all.nim"
@@ -56,6 +57,7 @@ proc runBenchs(args: string) =
   run args, "benchmarks/dfs/taskpool_dfs.nim"
   run args, "benchmarks/heat/taskpool_heat.nim"
   run args, "benchmarks/nqueens/taskpool_nqueens.nim"
+  run args, "benchmarks/iqs_latency/taskpool_iqs_latency.nim"
 
   when not defined(windows):
     run args, "benchmarks/single_task_producer/taskpool_spc.nim"
