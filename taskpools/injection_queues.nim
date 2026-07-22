@@ -24,14 +24,14 @@
 
 import std/atomics
 
-const TasksBetweenInjectionDrains* {.intdefine: "taskpoolsIqDrainTick".} = 61
+const tasksBetweenInjectionDrains* {.intdefine: "taskpoolsIqDrainTick".} = 61
   ## Drain the injection queue after processing at most this many local tasks,
   ## so externally submitted tasks are not starved while a worker churns through
   ## a local deque that internal spawns keep refilling. Prime to avoid resonance
   ## with regular workload sizes. Override with `-d:taskpoolsIqDrainTick:N`.
 
 static:
-  doAssert TasksBetweenInjectionDrains > 0,
+  doAssert tasksBetweenInjectionDrains > 0,
     "taskpoolsIqDrainTick must be a positive integer"
 
 type
@@ -49,8 +49,9 @@ proc init*[T](q: var InjectionQueue[T]) {.inline.} =
   ## Reset the queue to empty. Must be called before any push/drain.
   q.head.store(default(T), moRelaxed)
 
-proc push*[T](q: var InjectionQueue[T], node: T) {.inline.} =
+proc push*[T](q: var InjectionQueue[T], node: T, wasEmpty: var bool) {.inline.} =
   ## Push a node onto the queue from any thread (lock-free MPMC).
+  ## `wasEmpty` is set to `true` if the queue was empty before the push.
   ##
   ## The release CAS on the head makes the plain write to the intrusive link
   ## visible to the draining worker after its acquire exchange.
@@ -58,6 +59,7 @@ proc push*[T](q: var InjectionQueue[T], node: T) {.inline.} =
   while true:
     node.injectionNext = headOld  # plain write; ordered by the release CAS below
     if q.head.compareExchange(headOld, node, moRelease, moRelaxed):
+      wasEmpty = headOld.isNil
       break
 
 iterator drain*[T](q: var InjectionQueue[T]): T {.inline.} =

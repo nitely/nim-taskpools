@@ -53,8 +53,13 @@ task test, "Run tests":
   for mode in ["", "-d:release", "-d:danger"]:
     runTests(mode)
 
+task test_generic_futex, "Run tests with generic futex":
+  for mode in ["", "-d:release", "-d:danger"]:
+    run mode & " -d:taskpoolsGenericFutex", "tests/test_all.nim"
+
 proc runBenchs(args: string) =
   run args, "benchmarks/dfs/taskpool_dfs.nim"
+  # run args, "benchmarks/fibonacci/taskpool_fib.nim"
   run args, "benchmarks/heat/taskpool_heat.nim"
   run args, "benchmarks/nqueens/taskpool_nqueens.nim"
   run args, "benchmarks/iqs_latency/taskpool_iqs_latency.nim"
