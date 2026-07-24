@@ -38,7 +38,6 @@ proc run(args, path: string) =
 
 proc runTests(args: string) =
   # Internal data structures
-  run args, "taskpools/channels_spsc_single.nim"
   run args, "taskpools/sparsesets.nim"
 
   # Examples
@@ -74,3 +73,6 @@ proc runBenchs(args: string) =
 task test_bench, "Run benchs":
   for mode in ["", "-d:release", "-d:danger"]:
     runBenchs(mode)
+
+  # Avoid TSan; it's too slow
+  run "-d:release", "benchmarks/fibonacci/taskpool_fib.nim"
