@@ -40,7 +40,7 @@ proc main() =
   else:
     nthreads = countProcessors()
 
-  tp = Taskpool.new()
+  tp = Taskpool.new(numThreads = nthreads)
 
   # measure overhead during tasking
   when not defined(windows):
