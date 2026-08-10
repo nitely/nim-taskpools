@@ -49,6 +49,11 @@ proc init*[T](q: var InjectionQueue[T]) {.inline.} =
   ## Reset the queue to empty. Must be called before any push/drain.
   q.head.store(default(T), moRelaxed)
 
+proc isEmpty*[T](q: var InjectionQueue[T]): bool {.inline.} =
+  ## Whether the queue holds no node. Only meaningful once no thread can still
+  ## push, ie at teardown: otherwise the answer is stale as soon as it is returned.
+  q.head.load(moAcquire).isNil
+
 proc push*[T](q: var InjectionQueue[T], node: T, wasEmpty: var bool) {.inline.} =
   ## Push a node onto the queue from any thread (lock-free MPMC).
   ## `wasEmpty` is set to `true` if the queue was empty before the push.
