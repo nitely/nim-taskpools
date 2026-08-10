@@ -177,6 +177,25 @@ proc handoffAwaiter(rounds: int) {.thread.} =
     doAssert sync(fv) == 1
     handoffFilled.store(false, moRelease)
 
+# Reverse-order await
+# ---------------------------------------------------------------------------
+
+proc reverseInner(spins: int): int =
+  ## Awaited first. Spawns a fire-and-forget grandchild, then returns without
+  ## awaiting it, leaving it queued with *this* task as its parent.
+  tp.spawn bump()
+  for _ in 0 ..< spins:
+    cpuRelax()
+  2
+
+proc reverseOuter(spins: int): int =
+  ## Spawns two children and awaits them in the opposite order of their spawn.
+  let a = tp.spawn counted(spins)
+  let b = tp.spawn reverseInner(spins)
+  let rb = sync(b)
+  let ra = sync(a)
+  ra + rb # counted -> 1, reverseInner -> 2
+
 suite "Per-task backoff stress":
   setup:
     tp = Taskpool.new(numThreads())
@@ -234,6 +253,15 @@ suite "Per-task backoff stress":
   test "dependency chain; depth=200 x 500 rounds":
     for _ in 0 ..< 500:
       check sync(tp.spawn chain(200)) == 200
+
+  test "reverse-order await meets a grandchild; 128 runtimes x 16 rounds":
+    # Pathological case that hit the parent-mismatch branch in sync.
+    const rounds = 16
+    for spins in 0 ..< 128:
+      for _ in 0 ..< rounds:
+        check sync(tp.spawn reverseOuter(spins)) == 3
+    tp.syncAll()
+    check executed.load(moAcquire) == 128 * rounds
 
   test "fork-join tree; depth=12 x 50 rounds":
     for _ in 0 ..< 50:
@@ -294,3 +322,31 @@ suite "Per-task backoff stress, oversubscribed":
       createThread(t, extAwaiter, (tp, rounds))
     joinThreads(threads)
     check executed.load(moAcquire) == externalThreads * rounds
+
+suite "Per-task backoff, section-1 parent mismatch":
+  # Pins the parent-mismatch branch down deterministically, the way the first
+  # suite pins parking down: a 2-worker pool where the only non-root worker is
+  # held on the gate, so nothing the root spawns afterwards can be stolen and the
+  # scheduling is forced.
+  setup:
+    tp = Taskpool.new(2)
+    gate.store(false, moRelease)
+    running.store(false, moRelease)
+    executed.store(0, moRelease)
+
+  teardown:
+    tp.syncAll()
+    tp.shutdown()
+
+  test "sync in reverse spawn order meets a grandchild on the deque":
+    # Pathological case that hit the parent-mismatch branch in sync.
+    let a = tp.spawn gated()
+    while not running.load(moAcquire): # `a` is now off the root's deque
+      cpuRelax()
+    let b = tp.spawn reverseInner(0)   # not stealable: worker 1 is on the gate
+    check sync(b) == 2                  # runs `b` inline, leaving the grandchild
+    var opener: Thread[int]
+    createThread(opener, openGate, 100)
+    check sync(a) == 42                 # section-1 mismatch, then parks on `a`
+    joinThread(opener)
+    check executed.load(moAcquire) == 1 # the grandchild ran exactly once
