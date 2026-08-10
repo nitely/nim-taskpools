@@ -338,7 +338,7 @@ suite "Per-task backoff, section-1 parent mismatch":
     tp.syncAll()
     tp.shutdown()
 
-  test "a non-descendant met in sync is rescheduled, not dropped":
+  test "a non-descendant task in sync is rescheduled":
     # The grandchild is on our deque with a parent that is not our current task,
     # so section 1 hands it back to the pool instead of running it. What must
     # hold is that it is still *somewhere*: a section 1 that broke out without
