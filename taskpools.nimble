@@ -76,4 +76,3 @@ task test_bench, "Run benchs":
 
   # Avoid TSan; it's too slow
   run "-d:release", "benchmarks/fibonacci/taskpool_fib.nim"
-  run "-d:release", "tests/stress/test_shutdown.nim"

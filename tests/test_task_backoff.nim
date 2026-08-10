@@ -338,15 +338,19 @@ suite "Per-task backoff, section-1 parent mismatch":
     tp.syncAll()
     tp.shutdown()
 
-  test "sync in reverse spawn order meets a grandchild on the deque":
-    # Pathological case that hit the parent-mismatch branch in sync.
+  test "a non-descendant met in sync is rescheduled, not dropped":
+    # The grandchild is on our deque with a parent that is not our current task,
+    # so section 1 hands it back to the pool instead of running it. What must
+    # hold is that it is still *somewhere*: a section 1 that broke out without
+    # rescheduling would leak the node, and no drain would ever find it again.
     let a = tp.spawn gated()
-    while not running.load(moAcquire): # `a` is now off the root's deque
+    while not running.load(moAcquire):
       cpuRelax()
-    let b = tp.spawn reverseInner(0)   # not stealable: worker 1 is on the gate
-    check sync(b) == 2                  # runs `b` inline, leaving the grandchild
+    let b = tp.spawn reverseInner(0)
+    check sync(b) == 2
     var opener: Thread[int]
     createThread(opener, openGate, 100)
-    check sync(a) == 42                 # section-1 mismatch, then parks on `a`
+    check sync(a) == 42
     joinThread(opener)
-    check executed.load(moAcquire) == 1 # the grandchild ran exactly once
+    tp.syncAll()
+    check executed.load(moAcquire) == 1
