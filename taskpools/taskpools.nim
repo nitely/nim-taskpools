@@ -38,7 +38,6 @@
 {.push raises: [], gcsafe.} # Ensure no exceptions can happen
 
 import
-  system/ansi_c,
   std/[atomics, cpuinfo, isolation, macros, random, typetraits],
   ./[
     ast_utils, backoff, chase_lev_deques, flowvars,
@@ -49,7 +48,7 @@ import
 
 export
   # flowvars
-  Flowvar, isSpawned, isReady, sync, isolation
+  Flowvar, isSpawned, isReady, isolation
 
 const sharedHeap = defined(gcArc) or defined(gcOrc) or defined(gcAtomicArc)
 
@@ -187,7 +186,7 @@ proc workerEntryFn(params: tuple[taskpool: Taskpool, id: WorkerID]) =
 # Tasks
 # ---------------------------------------------
 
-proc runTask(ctx: var WorkerContext, tn: TaskNode) {.inline.} =
+proc runTask(ctx: var WorkerContext, tn: var TaskNode) {.inline.} =
   ## Run a task and consume the task node.
   ##
   ## The task environment is intrusive to the node, so the callback receives a
@@ -199,9 +198,12 @@ proc runTask(ctx: var WorkerContext, tn: TaskNode) {.inline.} =
   tn.callback(tn.env.addr)
   ctx.currentTask = suspendedTask
   if tn.hasFuture:
+    # Sync with an awaiting thread that may have parked on the task,
+    # then transfer ownership of the node to it.
     tn.setCompleted()
+    tn.setGcReady()
   else:
-    tp_free(tn)
+    tn.free()
 
 proc schedule(ctx: WorkerContext, tn: sink TaskNode, forceWake = false) {.inline.} =
   ## Schedule a task in the taskpool.
@@ -227,12 +229,14 @@ proc submitTask(tp: Taskpool, tn: TaskNode) {.inline.} =
     # the next worker will wake one after steal, and so on.
     tp.globalBackoff.wake()
 
-proc drainInjectionQueue(ctx: var WorkerContext) {.inline.} =
+proc drainInjectionQueue(ctx: var WorkerContext): bool {.inline, discardable.} =
   ## Atomically claim the entire injection queue and push all tasks into
   ## the calling worker's Chase-Lev deque, where they become stealable.
   ## Only one worker wins the exchange; the others drain nothing.
+  result = false
   for node in ctx.taskpool.injectionQueue.drain():
     ctx.taskDeque[].push(node)
+    result = true
 
 # Scheduler
 # ---------------------------------------------
@@ -266,7 +270,8 @@ proc eventLoop(ctx: var WorkerContext) =
       inc processed
       if processed >= tasksBetweenInjectionDrains:
         processed = 0
-        ctx.drainInjectionQueue()
+        if ctx.drainInjectionQueue():
+          ctx.taskpool.globalBackoff.wake()
 
     let ticket = ctx.taskpool.globalBackoff.sleepy()
 
@@ -310,7 +315,7 @@ proc RootTask(env: pointer) =
 template isRootTask(task: TaskNode): bool {.used.} =
   task.callback == RootTask
 
-proc forceFuture*[T](fv: Flowvar[T], parentResult: var T) =
+proc completeFuture[T](fv: Flowvar[T], parentResult: var T) =
   ## Eagerly complete an awaited Flowvar
 
   template ctx: untyped = workerContext
@@ -322,10 +327,10 @@ proc forceFuture*[T](fv: Flowvar[T], parentResult: var T) =
     return
 
   # External thread: no Chase-Lev deque and no steal peers available.
-  # Busy-wait while pool workers make progress on the task.
+  # There is nothing useful to do, so sleep until a worker completes the task.
   if ctx.taskpool.isNil:
     while not isFutReady():
-      cpuRelax()
+      fv.sleepUntilReady(waiterID = 0)
     return
 
   ## 1. Process all the children of the current tasks.
@@ -348,21 +353,44 @@ proc forceFuture*[T](fv: Flowvar[T], parentResult: var T) =
   ##    in hope it advances our awaited task. This prioritizes latency over throughput.
   debug: log("Worker %2d: sync 2 - future not ready, becoming a thief (currentTask 0x%.08x)\n", ctx.id, ctx.currentTask)
   while not isFutReady():
-    var taskNode = ctx.trySteal()
-
-    if not taskNode.isNil:
+    if (var taskNode = ctx.trySteal(); not taskNode.isNil):
       # Theft successful, there might be more work for idle threads, wake one
       ctx.taskpool.globalBackoff.wake()
       # We stole some task, we hope we advance our awaited task
       debug: log("Worker %2d: sync 2.1 - stole task 0x%.08x (parent 0x%.08x, current 0x%.08x)\n", ctx.id, taskNode, taskNode.parent, ctx.currentTask)
       ctx.runTask(taskNode)
-    # elif (taskNode = ctx.taskDeque[].pop(); not taskNode.isNil):
-    #   # We advance our own queue, this increases throughput but may impact latency on the awaited task
-    #   debug: log("Worker %2d: sync 2.2 - couldn't steal, running own task\n", ctx.id)
-    #   ctx.runTask(taskNode)
+    elif (var taskNode = ctx.taskDeque[].pop(); not taskNode.isNil):
+      # We advance our own queue, this increases throughput but may impact latency on the awaited task.
+      # It is also what makes parking below deadlock-free: a parked thread always
+      # has an empty deque, so the tasks left in it, possibly the awaited one,
+      # cannot be stranded behind a sleeping owner.
+      debug: log("Worker %2d: sync 2.2 - couldn't steal, running own task 0x%.08x (parent 0x%.08x, current 0x%.08x)\n", ctx.id, taskNode, taskNode.parent, ctx.currentTask)
+      ctx.runTask(taskNode)
+    #elif ctx.drainInjectionQueue():
+    #  # Drain injection queue, this increases throughput but may impact latency on the awaited task.
+    #  # These tasks themselves cannot possibly help advance the awaited future,
+    #  # but it could help the worker that would consume the queue if we don't.
+    #  debug: log("Worker %2d: sync 2.3 - drained the injection queue instead of parking\n", ctx.id)
+    #  ctx.taskpool.globalBackoff.wake()
     else:
-      # We don't park as there is no notif for task completion
-      cpuRelax()
+      # Nothing to do, we park until the thread running our awaited task
+      # completes it and wakes us up. We don't park on the global backoff as
+      # it cannot wake a specific thread, so if more work is created in the
+      # meantime we will miss it; that work is for a thread that can run it.
+      debug: log("Worker %2d: sync 2.3.a - empty runtime, sleeping until the awaited task completes\n", ctx.id)
+      fv.sleepUntilReady(ctx.id)
+      debug: log("Worker %2d: sync 2.3.b - awaited task completed, waking\n", ctx.id)
+
+proc sync*[T](fv: sink Flowvar[T]): T {.inline, gcsafe.} =
+  ## Blocks the current thread until the flowvar is available and returned.
+  ## Worker threads help execute pending tasks while waiting, and park on the
+  ## awaited task once they run out. Non-worker (external) threads have no task
+  ## to run, so they park immediately.
+  completeFuture(fv, result)
+  cleanup(fv)
+
+proc forceFuture*[T](fv: sink Flowvar[T], parentResult: var T) {.deprecated: "use sync".} =
+  parentResult = sync(fv)
 
 proc syncAll*(tp: Taskpool) =
   ## Blocks until all pending tasks are completed.
@@ -461,6 +489,8 @@ proc cleanup(tp: var Taskpool) =
   for i in 1 ..< tp.numThreads:
     joinThread(tp.workers[i])
 
+  postCondition: tp.injectionQueue.isEmpty()
+
   tp.workerSignals.tp_freeAligned()
   tp.workers.tp_freeAligned()
   tp.workerDeques.tp_freeAligned()
@@ -487,7 +517,7 @@ proc shutdown*(tp: var Taskpool) =
   tp.cleanup()
 
   # Dealloc dummy task
-  workerContext.currentTask.c_free()
+  workerContext.currentTask.free()
 
 # Task parallelism
 # ---------------------------------------------

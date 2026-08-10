@@ -19,5 +19,6 @@ import ./[
   test_heat,
   test_nqueens,
   test_single_thread,
-  test_spc
+  test_spc,
+  test_task_backoff
 ]
