@@ -107,7 +107,7 @@ proc main() =
 
   externalCompleted.store(0, moRelaxed)
   lastExtDoneMs.store(0, moRelaxed)
-  tp = Taskpool.new(numThreads = nthreads)
+  tp = Taskpool.new(numThreads = nthreads * 2)
 
   let start = wtime_msec()
 

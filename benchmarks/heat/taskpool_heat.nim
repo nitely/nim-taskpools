@@ -286,7 +286,7 @@ proc main() =
   initTest()
 
   # Fibril initializes before benching
-  tp = Taskpool.new(numThreads = nthreads)
+  tp = Taskpool.new(numThreads = nthreads * 2)
 
   prep()
   when not defined(windows):

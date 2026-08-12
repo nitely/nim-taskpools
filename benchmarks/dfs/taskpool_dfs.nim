@@ -65,7 +65,7 @@ proc main() =
   when not defined(windows):
     let start = wtime_usec()
 
-  tp = Taskpool.new(numThreads = nthreads)
+  tp = Taskpool.new(numThreads = nthreads * 2)
   answer = test(depth, breadth)
   tp.shutdown()
 
