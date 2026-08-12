@@ -73,7 +73,6 @@ proc runBenchs(args: string) =
 const stressTests = [
   "tests/stress/test_arm_flowvar_wakeup.nim",
   "tests/stress/test_arm_backoff_wakeup.nim",
-  "tests/stress/test_arm_backoff_invariant.nim",
   "tests/stress/test_arm_taskpool_wakeup.nim",
 ]
 

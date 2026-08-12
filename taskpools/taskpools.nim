@@ -245,18 +245,6 @@ proc drainInjectionQueue(ctx: var WorkerContext): bool {.inline, discardable.} =
 
 proc trySteal(ctx: var WorkerContext): TaskNode =
   ## Try to steal a task.
-  ##
-  ## A victim is only discarded once its deque has been *observed empty*. A steal
-  ## that merely lost its CAS race keeps the victim in the set to be retried.
-  ##
-  ## This matters for termination, not just throughput: callers treat a nil
-  ## result as "no work anywhere" and park on the global backoff. Since a task is
-  ## only notified once, on the empty -> non-empty transition of a deque, a thief
-  ## that mistakes a lost race for an empty deque consumes that single wakeup and
-  ## parks, leaving the task with nobody awake to steal it.
-  ##
-  ## Retrying terminates: a steal only aborts when another thread advanced `top`,
-  ## i.e. when some other thief or the owner made progress on that very deque.
 
   ctx.victims.refill()
   ctx.victims.excl(ctx.id)
@@ -264,13 +252,11 @@ proc trySteal(ctx: var WorkerContext): TaskNode =
   while not ctx.victims.isEmpty():
     let target = ctx.victims.randomPick(ctx.rng)
 
-    var aborted = false
-    let stolenTask = ctx.otherDeques[target].steal(aborted)
+    let stolenTask = ctx.otherDeques[target].steal()
     if not stolenTask.isNil:
       return stolenTask
 
-    if not aborted:
-      ctx.victims.excl(target)
+    ctx.victims.excl(target)
 
   return nil
 
