@@ -70,6 +70,32 @@ proc runBenchs(args: string) =
   # TODO - generics in macro issue
   # run args, "benchmarks/matmul_cache_oblivious/taskpool_matmul_co.nim"
 
+const stressTests = [
+  "tests/stress/test_arm_flowvar_wakeup.nim",
+  "tests/stress/test_arm_backoff_wakeup.nim",
+  "tests/stress/test_arm_taskpool_wakeup.nim",
+]
+
+task test_stress, "Run the weak-memory (ARM) lost-wakeup stress tests":
+  # These hunt for lost wakeups in the flowvar completion handshake and in the
+  # EventCount. They only ever fail on weakly-ordered CPUs (aarch64): on x86 the
+  # `lock`-prefixed RMWs are full barriers and hide the missing store-load
+  # ordering. Each test is watchdogged, so a lost wakeup aborts the process
+  # instead of hanging the CI job.
+  #
+  # Every scenario is capped by both an iteration count and a 20s time budget,
+  # whichever comes first, so the wall time is ~7 scenarios x 20s regardless of
+  # the core count (a `Taskpool.new()` spawns one thread per core, so a
+  # count-only cap would take orders of magnitude longer on a big machine).
+  #
+  # When actually hunting on aarch64 hardware, raise the budget and loop the
+  # binaries: -d:tpStressBudgetMs:600_000. The window is a handful of cycles
+  # wide, so soak time is what finds it.
+  # Tune with -d:tpStressBudgetMs:N -d:tpStressIters:N -d:tpStressRounds:N
+  #           -d:tpStressTimeoutMs:N (watchdog stall threshold)
+  for path in stressTests:
+    run "-d:release -d:tpStressBudgetMs:120_000", path
+
 task test_bench, "Run benchs":
   for mode in ["", "-d:release", "-d:danger"]:
     runBenchs(mode)

@@ -28,4 +28,4 @@ template dummyCpt*(): untyped =
     f1 = fib
 
 proc numThreads*(minThreads = 2): int =
-  max(minThreads, countProcessors()) * 8
+  max(minThreads, countProcessors())
