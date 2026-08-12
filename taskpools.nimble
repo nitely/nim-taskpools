@@ -99,6 +99,23 @@ task test_stress, "Run the weak-memory (ARM) lost-wakeup stress tests":
 task test_stress2, "Run shutdown test":
   run "-d:release", "tests/stress/test_shutdown.nim"
 
+task test_stall, "Run the suite under the stall detector (hang hunting)":
+  # Builds everything with -d:taskpoolsDebugStall. A watchdog thread polls the
+  # live pools at 10Hz; if a pool is bit-identical with nobody running for
+  # taskpoolsStallSeconds it dumps per-worker phases + pending work and aborts,
+  # so a hang fails the job in seconds with a diagnosis instead of timing out.
+  #
+  # The instrumentation is deliberately I/O-free on the scheduler paths (see
+  # taskpools/instrumentation/stall_detector.nim): the whole point is to not
+  # perturb the timings that make the bug reproduce.
+  #
+  # Tune the threshold with -d:taskpoolsStallSeconds:N (default 30).
+  let stallFlags = " -d:taskpoolsDebugStall"
+  for mode in ["-d:release", "-d:danger"]:
+    run mode & stallFlags, "tests/test_all.nim"
+    run mode & stallFlags & " -d:taskpoolsGenericFutex", "tests/test_all.nim"
+  run "-d:release" & stallFlags, "tests/stress/test_shutdown.nim"
+
 task test_bench, "Run benchs":
   for mode in ["", "-d:release", "-d:danger"]:
     runBenchs(mode)

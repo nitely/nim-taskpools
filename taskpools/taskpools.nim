@@ -44,7 +44,7 @@ import
     injection_queues, sparsesets,
   ],
   ./primitives/[barriers, allocs],
-  ./instrumentation/[contracts, loggers]
+  ./instrumentation/[contracts, loggers, stall_detector]
 
 export
   # flowvars
@@ -56,7 +56,12 @@ type
   WorkerID = int32
 
   Signal = object
+    # 64-byte aligned and written only by its owning worker, so the debug
+    # fields below never share a cache line with another writer.
     terminate {.align: 64.}: Atomic[bool]
+    when taskpoolsDebugStall:
+      phase: Atomic[uint32]      ## WorkerPhase; relaxed store, owner-only
+      tasksRun: Atomic[uint64]   ## relaxed increment, owner-only
 
   WorkerContext = object
     ## Thread-local worker context
@@ -95,6 +100,12 @@ type
     injectionQueue {.align: 64.}: InjectionQueue[TaskNode]
       ## Lock-free MPMC queue for tasks submitted by threads that are not
       ## currently running the scheduler (external threads or foreign pools).
+
+template setPhase(ctx: WorkerContext, p: untyped) =
+  ## One relaxed store to the worker's own cache line. Compiled out unless
+  ## -d:taskpoolsDebugStall.
+  when taskpoolsDebugStall:
+    ctx.signal.phase.store(uint32(p), moRelaxed)
 
 when not sharedHeap:
   proc supportsThreadMove*(T: type): bool {.compileTime.} =
@@ -139,6 +150,11 @@ proc setupWorker() =
   # Synchronization
   ctx.signal = addr ctx.taskpool.workerSignals[ctx.id]
   ctx.signal.terminate.store(false, moRelaxed)
+  when taskpoolsDebugStall:
+    # The root worker never enters `eventLoop`, so nothing else would set these
+    # before the detector's first poll.
+    ctx.signal.phase.store(uint32(phInit), moRelaxed)
+    ctx.signal.tasksRun.store(0, moRelaxed)
 
   # Tasks
   ctx.taskDeque = addr ctx.taskpool.workerDeques[ctx.id]
@@ -197,6 +213,11 @@ proc runTask(ctx: var WorkerContext, tn: var TaskNode) {.inline.} =
   ctx.currentTask = tn
   tn.callback(tn.env.addr)
   ctx.currentTask = suspendedTask
+  when taskpoolsDebugStall:
+    # Load+add+store, not fetchAdd: only the owning worker writes this, and the
+    # detector tolerates a stale read. That avoids an atomic RMW (`lock xadd` /
+    # `ldadd`) on the per-task path, leaving a plain load/add/store.
+    ctx.signal.tasksRun.store(ctx.signal.tasksRun.load(moRelaxed) + 1, moRelaxed)
   if tn.hasFuture:
     # Sync with an awaiting thread that may have parked on the task,
     # then transfer ownership of the node to it.
@@ -265,6 +286,7 @@ proc eventLoop(ctx: var WorkerContext) =
   while true:
     # 1. Pick from local deque
     debug: log("Worker %2d: eventLoop 1 - searching task from local deque\n", ctx.id)
+    ctx.setPhase(phRunning)
     var processed = 0'u32
     while (var taskNode = ctx.taskDeque[].pop(); not taskNode.isNil):
       debug: log("Worker %2d: eventLoop 1 - running task 0x%.08x (parent 0x%.08x, current 0x%.08x)\n", ctx.id, taskNode, taskNode.parent, ctx.currentTask)
@@ -275,6 +297,7 @@ proc eventLoop(ctx: var WorkerContext) =
         if ctx.drainInjectionQueue():
           ctx.taskpool.globalBackoff.wake()
 
+    ctx.setPhase(phSearching)
     let ticket = ctx.taskpool.globalBackoff.sleepy()
 
     # Drain the injection queue into our Chase-Lev deque so externally submitted
@@ -284,6 +307,7 @@ proc eventLoop(ctx: var WorkerContext) =
     if (var taskNode = ctx.taskDeque[].pop(); not taskNode.isNil):
       # 2. Local queue contains injected tasks.
       debug: log("Worker %2d: eventLoop 2 - running injected task 0x%.08x\n", ctx.id, taskNode)
+      ctx.setPhase(phRunning)
       ctx.taskpool.globalBackoff.cancelSleep()
       ctx.taskpool.globalBackoff.wake()
       ctx.runTask(taskNode)
@@ -291,6 +315,7 @@ proc eventLoop(ctx: var WorkerContext) =
       # 3. Run stolen task
       debug: log("Worker %2d: eventLoop 3 - stole task 0x%.08x (parent 0x%.08x, current 0x%.08x)\n", ctx.id, stolenTask, stolenTask.parent, ctx.currentTask)
       # We managed to steal a task, cancel sleep
+      ctx.setPhase(phRunning)
       ctx.taskpool.globalBackoff.cancelSleep()
       # Theft successful, there might be more work for idle threads, wake one
       # cancelSleep must be done before as wake has an optimization
@@ -300,12 +325,15 @@ proc eventLoop(ctx: var WorkerContext) =
     elif ctx.signal.terminate.load(moAcquire):
       # 4. Taskpool has no more tasks and we were signaled to terminate
       ctx.taskpool.globalBackoff.cancelSleep()
+      ctx.setPhase(phTerminated)
       debug: log("Worker %2d: eventLoop 4 - terminated\n", ctx.id)
       break
     else:
       # 5. Park the thread until a new task enters the taskpool
       debug: log("Worker %2d: eventLoop 5.a - sleeping\n", ctx.id)
+      ctx.setPhase(phParkedGlobal)
       ctx.taskpool.globalBackoff.sleep(ticket)
+      ctx.setPhase(phSearching)
       debug: log("Worker %2d: eventLoop 5.b - waking\n", ctx.id)
 
 # Tasking
@@ -334,6 +362,8 @@ proc completeFuture[T](fv: Flowvar[T], parentResult: var T) =
     while not isFutReady():
       fv.sleepUntilReady(waiterID = 0)
     return
+
+  ctx.setPhase(phSyncSteal)
 
   ## 1. Process all the children of the current tasks.
   ##    This ensures that we can give control back ASAP.
@@ -380,7 +410,12 @@ proc completeFuture[T](fv: Flowvar[T], parentResult: var T) =
       # it cannot wake a specific thread, so if more work is created in the
       # meantime we will miss it; that work is for a thread that can run it.
       debug: log("Worker %2d: sync 2.3.a - empty runtime, sleeping until the awaited task completes\n", ctx.id)
+      # Invisible to getNumWaiters: a flowvar-parked worker is registered in
+      # neither preSleep nor committedSleep. This phase is the only way the
+      # detector can tell it apart from a running one.
+      ctx.setPhase(phParkedFlowvar)
       fv.sleepUntilReady(ctx.id)
+      ctx.setPhase(phSyncSteal)
       debug: log("Worker %2d: sync 2.3.b - awaited task completed, waking\n", ctx.id)
 
 proc sync*[T](fv: sink Flowvar[T]): T {.inline, gcsafe.} =
@@ -409,6 +444,7 @@ proc syncAll*(tp: Taskpool) =
 
   preCondition: ctx.id == 0
   preCondition: ctx.currentTask.isRootTask()
+  ctx.setPhase(phSyncAll)
 
   # Empty all tasks
   while true:
@@ -446,6 +482,143 @@ proc syncAll*(tp: Taskpool) =
   debugTermination:
     log(">>> Worker %2d leaves barrier <<<\n", ctx.id)
 
+# Stall detector
+# ---------------------------------------------
+# Everything below is compiled out unless -d:taskpoolsDebugStall.
+# See taskpools/instrumentation/stall_detector.nim for the design constraints.
+
+when taskpoolsDebugStall:
+  import std/os
+  import system/ansi_c
+
+  const
+    maxWatchedPools = 64
+    stallSeconds {.intdefine: "taskpoolsStallSeconds".} = 30
+      ## How long the whole pool must be bit-identical *and* have nobody
+      ## running before we call it a stall. Raise it if a legitimate task in
+      ## your workload runs longer than this.
+    pollMs = 100
+
+  var
+    watchedPools: array[maxWatchedPools, Atomic[pointer]]
+    watchedBusy: array[maxWatchedPools, Atomic[int]]
+      ## Held by the detector while it reads a pool, so teardown cannot free
+      ## the object out from under it.
+    watchdogStarted: Atomic[bool]
+    watchdogThread: Thread[void]
+
+  proc dumpPool(tp: Taskpool, fingerprint: uint64) =
+    ## Only ever called once, after a stall is already confirmed, so the cost
+    ## of the I/O here is irrelevant.
+    discard c_printf("\n=========== TASKPOOL STALL DETECTED ===========\n")
+    discard c_printf("pool %p, %d threads, no progress for %ds\n",
+      tp, cint(tp.numThreads), cint(stallSeconds))
+
+    let waiters = tp.globalBackoff.getNumWaiters()
+    discard c_printf("globalBackoff: preSleep=%d committedSleep=%d\n",
+      cint(waiters.preSleep), cint(waiters.committedSleep))
+
+    let injectionPending = not tp.injectionQueue.isEmpty()
+    discard c_printf("injectionQueue: %s\n",
+      if injectionPending: cstring"NON-EMPTY (ownerless work!)" else: cstring"empty")
+
+    var totalPending = 0
+    discard c_printf("\n  id  phase             deque  tasksRun  terminate\n")
+    for i in 0 ..< tp.numThreads:
+      let
+        ph = toPhase(tp.workerSignals[i].phase.load(moRelaxed))
+        pending = tp.workerDeques[i].peek()
+        ran = tp.workerSignals[i].tasksRun.load(moRelaxed)
+        term = tp.workerSignals[i].terminate.load(moRelaxed)
+      totalPending += pending
+      discard c_printf("  %2d  %-16s  %5d  %8llu  %s\n",
+        cint(i), ph.phaseName(), cint(pending), ran,
+        if term: cstring"yes" else: cstring"no")
+
+    discard c_printf("\n--- diagnosis ---\n")
+    if totalPending > 0:
+      discard c_printf(
+        "%d task(s) pending in worker deques while nobody is running them.\n" &
+        "  -> work stranded behind a parked/blocked owner; check which worker\n" &
+        "     owns the non-empty deque and what phase it is in.\n", cint(totalPending))
+    if injectionPending:
+      discard c_printf(
+        "Injection queue is NON-EMPTY. It has no owner to fall back on, so\n" &
+        "  -> a submitTask() wakeup was lost.\n")
+    if totalPending == 0 and not injectionPending:
+      discard c_printf(
+        "No work pending anywhere, yet nothing is progressing.\n" &
+        "  -> a task was dropped, or a completion was never signalled\n" &
+        "     (flowvar handshake / EventCount epoch).\n")
+    discard c_printf("\nfingerprint=%llu\n", fingerprint)
+    discard c_printf(
+      "Aborting for a core dump. Recover the stacks with:\n" &
+      "  gdb -batch -ex \"thread apply all bt\" <exe> <core>\n")
+    discard c_printf("===============================================\n")
+    flushFile(stdout)
+
+  proc snapshot(tp: Taskpool, anyRunning: var bool): uint64 =
+    ## Purely passive: reads state the scheduler already maintains.
+    anyRunning = false
+    result = 0'u64
+    let waiters = tp.globalBackoff.getNumWaiters()
+    result = result * 31 + uint64(waiters.preSleep)
+    result = result * 31 + uint64(waiters.committedSleep)
+    result = result * 31 + (if tp.injectionQueue.isEmpty(): 0'u64 else: 1'u64)
+    for i in 0 ..< tp.numThreads:
+      let ph = toPhase(tp.workerSignals[i].phase.load(moRelaxed))
+      if ph == phRunning:
+        anyRunning = true
+      result = result * 31 + uint64(ph)
+      result = result * 31 + tp.workerSignals[i].tasksRun.load(moRelaxed)
+      result = result * 31 + uint64(tp.workerDeques[i].peek())
+
+  proc watchdogLoop() {.thread.} =
+    var
+      lastPrint: array[maxWatchedPools, uint64]
+      stableMs: array[maxWatchedPools, int]
+    while true:
+      sleep(pollMs)
+      for slot in 0 ..< maxWatchedPools:
+        discard watchedBusy[slot].fetchAdd(1, moAcquire)
+        let raw = watchedPools[slot].load(moAcquire)
+        if not raw.isNil:
+          let tp = cast[Taskpool](raw)
+          var anyRunning = false
+          let fp = tp.snapshot(anyRunning)
+          # A long-running task looks identical to a stall except that someone
+          # is in phRunning, so requiring "nobody running" removes that whole
+          # class of false positive.
+          if fp == lastPrint[slot] and not anyRunning:
+            stableMs[slot] += pollMs
+            if stableMs[slot] >= stallSeconds * 1000:
+              tp.dumpPool(fp)
+              c_abort()
+          else:
+            lastPrint[slot] = fp
+            stableMs[slot] = 0
+        else:
+          stableMs[slot] = 0
+        discard watchedBusy[slot].fetchSub(1, moRelease)
+
+  proc registerPool(tp: Taskpool) {.raises: [ResourceExhaustedError].} =
+    if not watchdogStarted.exchange(true, moAcquireRelease):
+      createThread(watchdogThread, watchdogLoop)
+    for slot in 0 ..< maxWatchedPools:
+      var expected: pointer = nil
+      if watchedPools[slot].compareExchange(expected, cast[pointer](tp), moAcquireRelease, moRelaxed):
+        return
+
+  proc unregisterPool(tp: Taskpool) =
+    for slot in 0 ..< maxWatchedPools:
+      var expected = cast[pointer](tp)
+      if watchedPools[slot].compareExchange(expected, nil, moAcquireRelease, moRelaxed):
+        # Wait for the detector to stop looking at this slot before the caller
+        # frees the object.
+        while watchedBusy[slot].load(moAcquire) != 0:
+          cpuRelax()
+        return
+
 # Runtime
 # ---------------------------------------------
 
@@ -482,11 +655,16 @@ proc new*(T: type Taskpool, numThreads = countProcessors()): T {.raises: [Catcha
 
   # Wait for the child threads
   discard tp.barrier.wait()
+  when taskpoolsDebugStall:
+    tp.registerPool()
   return tp
 
 proc cleanup(tp: var Taskpool) =
   ## Cleanup all resources allocated by the taskpool
   preCondition: workerContext.currentTask.isRootTask()
+
+  when taskpoolsDebugStall:
+    tp.unregisterPool()
 
   for i in 1 ..< tp.numThreads:
     joinThread(tp.workers[i])

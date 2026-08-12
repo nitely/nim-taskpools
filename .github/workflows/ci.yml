@@ -18,3 +18,18 @@ jobs:
         env NIMLANG=c nimble test
         env NIMLANG=c nimble test_generic_futex
         env NIMLANG=c nimble test_bench
+
+  # Hang hunting. Runs the suite with -d:taskpoolsDebugStall so a deadlock
+  # aborts with a per-worker diagnosis in seconds instead of burning the job
+  # timeout. The instrumentation does no I/O on the scheduler paths, so it does
+  # not perturb the timings that make the bug reproduce.
+  #
+  # Failures are expected to be rare: re-run this job in a loop when hunting.
+  stall-detector:
+    uses: ./.github/workflows/common.yml
+    with:
+      nim-versions: '["version-2-2"]'
+      test-command: |
+        nim -v
+        ulimit -c unlimited
+        env NIMLANG=c nimble test_stall
