@@ -193,8 +193,19 @@ proc pop*[T](deque: var ChaseLevDeque[T]): T =
     result = default(T)
     deque.bottom.store(b+1, moRelaxed)
 
-proc steal*[T](deque: var ChaseLevDeque[T]): T =
-  ## Deque an item at the top
+proc steal*[T](deque: var ChaseLevDeque[T], aborted: var bool): T =
+  ## Deque an item at the top.
+  ##
+  ## Returns `nil` both when the deque is empty and when the steal lost its race
+  ## against a concurrent `pop`/`steal`. `aborted` distinguishes the two: when it
+  ## is set, the deque may well still hold items and the caller must retry
+  ## instead of concluding the victim is empty.
+  ##
+  ## The distinction is load-bearing, not just a throughput matter: a thief that
+  ## mistakes a lost race for an empty deque parks on the EventCount, destroying
+  ## the single wakeup that was issued for that work (see `schedule`, which only
+  ## notifies on the empty -> non-empty transition).
+  aborted = false
   var t = deque.top.load(moAcquire)
   fence(moSequentiallyConsistent)
   let b = deque.bottom.load(moAcquire)
@@ -205,8 +216,16 @@ proc steal*[T](deque: var ChaseLevDeque[T]): T =
     let a = deque.buf.load(moConsume)
     result = a[][t]
     if not compareExchange(deque.top, t, t+1, moSequentiallyConsistent, moRelaxed):
-      # Failed race.
+      # Failed race: the deque is not necessarily empty.
+      aborted = true
       return default(T)
+
+proc steal*[T](deque: var ChaseLevDeque[T]): T {.inline.} =
+  ## Deque an item at the top, without reporting whether a nil result was an
+  ## empty deque or a lost race. Prefer the `aborted` overload when the caller
+  ## would otherwise treat nil as "no work available".
+  var aborted {.used.}: bool
+  deque.steal(aborted)
 
 {.pop.} # overflowChecks
 {.pop.} # raises: []
