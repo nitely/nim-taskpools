@@ -12,6 +12,7 @@
 # a global variable inet_ntop that stores a proc from "Ws2_32.dll"
 
 import std/atomics
+import ./futex_checks
 export MemoryOrder
 
 # OS primitives
@@ -41,7 +42,13 @@ type
   Futex* = object
     value: Atomic[uint32]
 
+static:
+  # The kernel primitives compare a 32-bit word at the futex address; a padded
+  # or resized atomic would silently make them compare the wrong bytes.
+  doAssert sizeof(Atomic[uint32]) == 4, "the futex word must be exactly 32-bit"
+
 proc initialize*(futex: var Futex) {.inline.} =
+  checkFutexAlignment(futex.value.addr)
   futex.value.store(0, moRelaxed)
 
 proc teardown*(futex: var Futex) {.inline.} =
@@ -61,15 +68,32 @@ proc wait*(futex: var Futex, expected: uint32) {.inline.} =
   ## Suspend a thread if the value of the futex is the same as expected.
 
   # Returns TRUE if the wait succeeds or FALSE if not.
-  # getLastError() will contain the error information, for example
-  # if it failed due to a timeout.
-  # We discard as this is not needed and simplifies compat with Linux futex
-  discard WaitOnAddress(futex.value.addr, expected.addr, csize_t sizeof(expected), INFINITE)
+  # We pass INFINITE, so ERROR_TIMEOUT cannot occur: a FALSE here means the
+  # wait was rejected outright and we never parked, leaving the caller to spin
+  # on its condition. Not fatal, but it points at a broken futex word (see
+  # checkFutexAlignment), so surface it rather than swallow it.
+  #
+  # NOTE: WaitOnAddress may also return TRUE spuriously; every caller re-checks
+  # its condition in a loop, so that is handled.
+  let ok {.used.} = WaitOnAddress(
+    futex.value.addr, expected.addr, csize_t sizeof(expected), INFINITE)
+  doAssert ok != 0, "WaitOnAddress failed unexpectedly " & $ok
 
 proc wake*(futex: var Futex) {.inline.} =
   ## Wake one thread (from the same process)
+  ##
+  ## Unlike the Linux and Darwin backends there is nothing to harden: this
+  ## returns void and reports neither failure nor the number of threads woken,
+  ## so a rejected wake here is undetectable by design.
   WakeByAddressSingle(futex.value.addr)
 
 proc wakeAll*(futex: var Futex) {.inline.} =
   ## Wake all threads (from the same process)
+  ##
+  ## Only reaches threads already parked inside WaitOnAddress. A thread that
+  ## has committed to sleep but not yet entered the call is covered by the
+  ## epoch bump the caller performs *before* this, which makes its WaitOnAddress
+  ## fail the CompareAddress check and return immediately.
+  ##
+  ## Returns void: a rejected wake is undetectable, see `wake`.
   WakeByAddressAll(futex.value.addr)

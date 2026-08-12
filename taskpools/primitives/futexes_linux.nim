@@ -10,7 +10,8 @@
 # Condition variables do not always wake on signal which can deadlock the runtime
 # so we need to roll up our sleeves and use the low-level futex API.
 
-import std/atomics
+import std/[atomics, posix]
+import ./futex_checks
 export MemoryOrder
 
 # OS primitives
@@ -38,7 +39,13 @@ type
   Futex* = object
     value: Atomic[uint32]
 
+static:
+  # The kernel primitives compare a 32-bit word at the futex address; a padded
+  # or resized atomic would silently make them compare the wrong bytes.
+  doAssert sizeof(Atomic[uint32]) == 4, "the futex word must be exactly 32-bit"
+
 proc initialize*(futex: var Futex) {.inline.} =
+  checkFutexAlignment(futex.value.addr)
   futex.value.store(0, moRelaxed)
 
 proc teardown*(futex: var Futex) {.inline.} =
@@ -57,23 +64,36 @@ proc increment*(futex: var Futex, value: uint32, order: MemoryOrder): uint32 {.i
 proc wait*(futex: var Futex, expected: uint32) {.inline.} =
   ## Suspend a thread if the value of the futex is the same as expected.
 
-  # Returns 0 in case of a successful suspend
-  # If value are different, it returns EWOULDBLOCK
-  # We discard as this is not needed and simplifies compat with Windows futex
-  discard sysFutex(futex.value.addr, FUTEX_WAIT_PRIVATE, expected)
+  # Returns 0 on a successful suspend + wake.
+  # EAGAIN means the value already changed so we never parked - the caller
+  # re-checks in its loop. EINTR is a signal. Both are normal and expected.
+  # Any other failure means the wait was rejected outright: the caller spins on
+  # its condition instead of parking. Not fatal, but it points at a broken futex
+  # word (see checkFutexAlignment), so surface it rather than swallow it.
+  let res {.used.} = sysFutex(futex.value.addr, FUTEX_WAIT_PRIVATE, expected)
+  doAssert res == 0 or (res == -1 and (errno == EAGAIN or errno == EINTR)),
+    "FUTEX_WAIT failed unexpectedly " & $res
 
 proc wake*(futex: var Futex) {.inline.} =
   ## Wake one thread (from the same process)
 
-  # Returns the number of actually woken threads
-  # or a Posix error code (if negative)
-  # We discard as this is not needed and simplifies compat with Windows futex
-  discard sysFutex(futex.value.addr, FUTEX_WAKE_PRIVATE, 1)
+  # Returns the number of threads actually woken - 0 is normal, it just means
+  # nobody was parked - or -1 on failure. A failed wake is a *silent* lost
+  # wakeup: the waiter stays parked forever and no caller here retries a wake.
+  let res {.used.} = sysFutex(futex.value.addr, FUTEX_WAKE_PRIVATE, 1)
+  doAssert res >= 0, "FUTEX_WAKE failed - a parked thread will never be woken " & $res
 
 proc wakeAll*(futex: var Futex) {.inline.} =
   ## Wake all threads (from the same process)
+  ##
+  ## This only reaches threads already queued in the kernel. A thread that has
+  ## committed to sleep but has not yet entered the syscall is not woken here;
+  ## it is covered by the epoch bump the caller performs *before* this call,
+  ## which makes its `wait` fail the kernel-side value comparison and return
+  ## EAGAIN immediately.
 
-  # Returns the number of actually woken threads
-  # or a Posix error code (if negative)
-  # We discard as this is not needed and simplifies compat with Windows futex
-  discard sysFutex(futex.value.addr, FUTEX_WAKE_PRIVATE, high(int32))
+  # Returns the number of threads actually woken, or -1 on failure.
+  # `Taskpool.shutdown` issues exactly one wakeAll and then blocks on a barrier,
+  # so a failure here hangs the process permanently.
+  let res {.used.} = sysFutex(futex.value.addr, FUTEX_WAKE_PRIVATE, high(int32))
+  doAssert res >= 0, "FUTEX_WAKE(all) failed - parked threads will never be woken " & $res

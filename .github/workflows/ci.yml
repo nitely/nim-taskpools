@@ -15,5 +15,6 @@ jobs:
       test-command: |
         nim -v
         nimble list --installed --version
-        env NIMLANG=c nimble test_stress
-        env NIMLANG=c nimble test_stress2
+        env NIMLANG=c nimble test
+        env NIMLANG=c nimble test_generic_futex
+        env NIMLANG=c nimble test_bench
