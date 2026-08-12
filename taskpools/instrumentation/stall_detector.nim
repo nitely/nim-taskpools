@@ -60,10 +60,10 @@ when taskpoolsDebugStall:
       ## Where a worker is. Ordered so that "can still make progress" phases
       ## sort below the parked ones.
       phInit = 0          ## created, not yet in the event loop
-      phRunning           ## executing a task callback
+      phRunning           ## executing a task, or back in caller code
       phSearching         ## between sleepy() and the park decision
       phSyncAll           ## root spinning in syncAll
-      phSyncSteal         ## in completeFuture, stealing/draining
+      phSyncSteal         ## inside completeFuture, stealing/draining
       phParkedGlobal      ## parked in EventCount.sleep
       phParkedFlowvar     ## parked in sleepUntilComplete - invisible to getNumWaiters
       phTerminated        ## left the event loop

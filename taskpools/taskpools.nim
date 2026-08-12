@@ -364,6 +364,9 @@ proc completeFuture[T](fv: Flowvar[T], parentResult: var T) =
     return
 
   ctx.setPhase(phSyncSteal)
+  # Otherwise a worker that has returned to caller code still reads as
+  # sync-steal, which misreports where a stalled thread actually is.
+  defer: ctx.setPhase(phRunning)
 
   ## 1. Process all the children of the current tasks.
   ##    This ensures that we can give control back ASAP.
@@ -479,6 +482,7 @@ proc syncAll*(tp: Taskpool) =
       # 5. We don't park as there is no notif for task completion
       cpuRelax()
 
+  ctx.setPhase(phRunning)
   debugTermination:
     log(">>> Worker %2d leaves barrier <<<\n", ctx.id)
 

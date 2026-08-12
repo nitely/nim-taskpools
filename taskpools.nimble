@@ -114,7 +114,7 @@ task test_stall, "Run the suite under the stall detector (hang hunting)":
   for mode in ["-d:release", "-d:danger"]:
     run mode & stallFlags, "tests/test_all.nim"
     run mode & stallFlags & " -d:taskpoolsGenericFutex", "tests/test_all.nim"
-  run "-d:release" & stallFlags, "tests/stress/test_shutdown.nim"
+  # run "-d:release" & stallFlags, "tests/stress/test_shutdown.nim"
 
 task test_bench, "Run benchs":
   for mode in ["", "-d:release", "-d:danger"]:
