@@ -73,7 +73,7 @@ proc runBenchs(args: string) =
 const stressTests = [
   "tests/stress/test_arm_flowvar_wakeup.nim",
   "tests/stress/test_arm_backoff_wakeup.nim",
-  #"tests/stress/test_arm_taskpool_wakeup.nim",
+  "tests/stress/test_arm_taskpool_wakeup.nim",
 ]
 
 task test_stress, "Run the weak-memory (ARM) lost-wakeup stress tests":
@@ -95,6 +95,9 @@ task test_stress, "Run the weak-memory (ARM) lost-wakeup stress tests":
   #           -d:tpStressTimeoutMs:N (watchdog stall threshold)
   for path in stressTests:
     run "-d:release -d:tpStressBudgetMs:60_000 -d:tpStressIters:50_000_000 -d:tpStressRounds:5_000_000", path
+
+task test_stress2, "Run shutdown test":
+  run "-d:release", "tests/stress/test_shutdown.nim"
 
 task test_bench, "Run benchs":
   for mode in ["", "-d:release", "-d:danger"]:

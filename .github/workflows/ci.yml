@@ -16,3 +16,4 @@ jobs:
         nim -v
         nimble list --installed --version
         env NIMLANG=c nimble test_stress
+        env NIMLANG=c nimble test_stress2
