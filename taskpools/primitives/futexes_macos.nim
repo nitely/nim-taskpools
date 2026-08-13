@@ -15,65 +15,17 @@ export MemoryOrder
 # Darwin futexes.
 # https://github.com/odin-lang/Odin/blob/6983813b4ece0e48539dc1d3e7c7437569db1dc2/core/sync/futex_darwin.odin
 
-{.push hint[XDeclaredButNotUsed]: off.}
-
-const UL_COMPARE_AND_WAIT            = 1
-const UL_UNFAIR_LOCK                 = 2
-const UL_COMPARE_AND_WAIT_SHARED     = 3
-const UL_UNFAIR_LOCK64_SHARED        = 4
-const UL_COMPARE_AND_WAIT64          = 5
-const UL_COMPARE_AND_WAIT64_SHARED   = 6
-# obsolete names
-const UL_OSSPINLOCK                  = UL_COMPARE_AND_WAIT
-const UL_HANDOFFLOCK                 = UL_UNFAIR_LOCK
-#  These operation code are only implemented in (DEVELOPMENT || DEBUG) kernels
-const UL_DEBUG_SIMULATE_COPYIN_FAULT = 253
-const UL_DEBUG_HASH_DUMP_ALL         = 254
-const UL_DEBUG_HASH_DUMP_PID         = 255
+const UL_COMPARE_AND_WAIT = 1
 
 # operation bits [15, 8] contain the flags for __ulock_wake
 #
-const ULF_WAKE_ALL                   =  0x00000100
-const ULF_WAKE_THREAD                =  0x00000200
-const ULF_WAKE_ALLOW_NON_OWNER       =  0x00000400
-
-# operation bits [23, 16] contain the flags for __ulock_wait
-#
-# @const ULF_WAIT_WORKQ_DATA_CONTENTION
-# The waiter is contending on this lock for synchronization around global data.
-# This causes the workqueue subsystem to not create new threads to offset for
-# waiters on this lock.
-#
-# @const ULF_WAIT_CANCEL_POINT
-# This wait is a cancelation point
-#
-# @const ULF_WAIT_ADAPTIVE_SPIN
-# Use adaptive spinning when the thread that currently holds the unfair lock
-# is on core.
-const ULF_WAIT_WORKQ_DATA_CONTENTION = 0x00010000
-const ULF_WAIT_CANCEL_POINT          = 0x00020000
-const ULF_WAIT_ADAPTIVE_SPIN         = 0x00040000
+const ULF_WAKE_ALL = 0x00000100
 
 # operation bits [31, 24] contain the generic flags
-const ULF_NO_ERRNO                   = 0x01000000
+const ULF_NO_ERRNO = 0x01000000
 
-# masks
-const UL_OPCODE_MASK                 = 0x000000FF
-const UL_FLAGS_MASK                  = 0xFFFFFF00
-const ULF_GENERIC_MASK               = 0xFFFF0000
-
-const ULF_WAIT_MASK     = ULF_NO_ERRNO or
-                          ULF_WAIT_WORKQ_DATA_CONTENTION or
-                          ULF_WAIT_CANCEL_POINT or
-                          ULF_WAIT_ADAPTIVE_SPIN
-
-const ULF_WAKE_MASK     = ULF_NO_ERRNO or
-                          ULF_WAKE_ALL or
-                          ULF_WAKE_THREAD or
-                          ULF_WAKE_ALLOW_NON_OWNER
-
+# proc ulock_wait2(operation: uint32, address: pointer, expected: uint64, timeout, value2: uint64): cint {.importc:"__ulock_wait2", noconv.}
 proc ulock_wait(operation: uint32, address: pointer, expected: uint64, timeout: uint32): cint {.importc:"__ulock_wait", noconv.}
-proc ulock_wait2(operation: uint32, address: pointer, expected: uint64, timeout, value2: uint64): cint {.importc:"__ulock_wait2", noconv.}
 proc ulock_wake(operation: uint32, address: pointer, wake_value: uint64): cint {.importc:"__ulock_wake", noconv.}
 
 # Futex API
@@ -110,5 +62,3 @@ proc wake*(futex: var Futex) {.inline.} =
 proc wakeAll*(futex: var Futex) {.inline.} =
   ## Wake all threads (from the same process)
   discard ulock_wake(UL_COMPARE_AND_WAIT or ULF_WAKE_ALL or ULF_NO_ERRNO, futex.value.addr, 0)
-
-{.pop.}
