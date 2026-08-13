@@ -91,5 +91,5 @@ suite "Call types":
         futs.add tp.spawn(argstr(s))
       var total = 0
       for i in 0 ..< 64:
-        total += sync futs[i]
+        total += sync move(futs[i])
       check total == expected
