@@ -62,6 +62,7 @@ type
     when taskpoolsDebugStall:
       phase: Atomic[uint32]      ## WorkerPhase; relaxed store, owner-only
       tasksRun: Atomic[uint64]   ## relaxed increment, owner-only
+      parkTicket: Atomic[uint32] ## epoch this worker last parked on
 
   WorkerContext = object
     ## Thread-local worker context
@@ -281,6 +282,19 @@ proc trySteal(ctx: var WorkerContext): TaskNode =
 
   return nil
 
+when taskpoolsDebugStall:
+  proc recordParkState(ctx: var WorkerContext, ticket: ParkingTicket) =
+    ## Records only the ticket epoch this worker is about to park on - a value
+    ## already in a register, stored to the worker's own cache line.
+    ##
+    ## An earlier version also scanned every other deque here to record what the
+    ## worker could see. That answered its question (workers park having
+    ## correctly observed every deque empty) but the cross-thread cache traffic
+    ## dropped the reproduction rate from 10/10 to roughly 1/3, so it is gone.
+    ## Anything needing other threads' state belongs in the detector thread,
+    ## which reads it off the hot path.
+    ctx.signal.parkTicket.store(ticket.ticketEpoch(), moRelaxed)
+
 proc eventLoop(ctx: var WorkerContext) =
   ## Each worker thread executes this loop over and over.
   while true:
@@ -331,6 +345,8 @@ proc eventLoop(ctx: var WorkerContext) =
     else:
       # 5. Park the thread until a new task enters the taskpool
       debug: log("Worker %2d: eventLoop 5.a - sleeping\n", ctx.id)
+      when taskpoolsDebugStall:
+        ctx.recordParkState(ticket)
       ctx.setPhase(phParkedGlobal)
       ctx.taskpool.globalBackoff.sleep(ticket)
       ctx.setPhase(phSearching)
@@ -527,17 +543,33 @@ when taskpoolsDebugStall:
       if injectionPending: cstring"NON-EMPTY (ownerless work!)" else: cstring"empty")
 
     var totalPending = 0
-    discard c_printf("\n  id  phase             deque  tasksRun  terminate\n")
+    discard c_printf(
+      "\n  id  phase              top  bottom   cap  pending  tasksRun  term\n")
     for i in 0 ..< tp.numThreads:
       let
         ph = toPhase(tp.workerSignals[i].phase.load(moRelaxed))
-        pending = tp.workerDeques[i].peek()
+        st = tp.workerDeques[i].debugState()
+        pending = max(0, st.bottom - st.top)
         ran = tp.workerSignals[i].tasksRun.load(moRelaxed)
         term = tp.workerSignals[i].terminate.load(moRelaxed)
       totalPending += pending
-      discard c_printf("  %2d  %-16s  %5d  %8llu  %s\n",
-        cint(i), ph.phaseName(), cint(pending), ran,
+      discard c_printf("  %2d  %-16s %5d  %6d  %4d  %7d  %8llu  %s\n",
+        cint(i), ph.phaseName(), cint(st.top), cint(st.bottom),
+        cint(st.capacity), cint(pending), ran,
         if term: cstring"yes" else: cstring"no")
+
+    # Each parked worker's ticket vs the live epoch. A ticket equal to the
+    # current epoch means nothing bumped `events` since that worker parked; a
+    # ticket behind it means the bump happened and the wake still did not land.
+    discard c_printf("\nEventCount epoch now=%u\n",
+      tp.globalBackoff.debugEpoch())
+    discard c_printf("  id  parked-on-epoch\n")
+    for i in 0 ..< tp.numThreads:
+      let ph = toPhase(tp.workerSignals[i].phase.load(moRelaxed))
+      if ph != phParkedGlobal:
+        continue
+      discard c_printf("  %2d  %15u\n",
+        cint(i), tp.workerSignals[i].parkTicket.load(moRelaxed))
 
     discard c_printf("\n--- diagnosis ---\n")
     if totalPending > 0:
