@@ -48,6 +48,11 @@ proc runTests(args: string) =
   # Tests
   run args, "tests/test_all.nim"
 
+  # Regression test for the schedule/push lost wakeup. Kept out of test_all
+  # because it hangs rather than fails when the bug is back - run it under a
+  # timeout in CI.
+  run args, "tests/test_spawn_spin.nim"
+
 task test, "Run tests":
   for mode in ["", "-d:release", "-d:danger"]:
     runTests(mode)
