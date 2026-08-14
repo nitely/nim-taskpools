@@ -607,7 +607,7 @@ when taskpoolsDebugStall:
         anyRunning = true
       result = result * 31 + uint64(ph)
       result = result * 31 + tp.workerSignals[i].tasksRun.load(moRelaxed)
-      result = result * 31 + uint64(tp.workerDeques[i].peek())
+      #result = result * 31 + uint64(tp.workerDeques[i].peek())
 
   proc watchdogLoop() {.thread.} =
     var
