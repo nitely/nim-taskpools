@@ -17,6 +17,8 @@ jobs:
         nimble list --installed --version
         env NIMLANG=c nimble test
         env NIMLANG=c nimble test_stall
+        env NIMLANG=c nimble test_stress
+        env NIMLANG=c nimble test_stress2
 
   # ulimit -c unlimited
         

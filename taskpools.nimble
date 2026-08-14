@@ -79,6 +79,7 @@ const stressTests = [
   "tests/stress/test_arm_flowvar_wakeup.nim",
   "tests/stress/test_arm_backoff_wakeup.nim",
   "tests/stress/test_arm_taskpool_wakeup.nim",
+  "tests/stress/test_spawn_spin.nim",
 ]
 
 task test_stress, "Run the weak-memory (ARM) lost-wakeup stress tests":
