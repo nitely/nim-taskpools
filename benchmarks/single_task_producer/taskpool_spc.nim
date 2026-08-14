@@ -104,7 +104,7 @@ proc main() =
   else:
     nthreads = countProcessors()
 
-  tp = Taskpool.new(numThreads = nthreads)
+  tp = Taskpool.new(numThreads = nthreads * 2)
 
   # measure overhead during tasking
   var ru: Rusage

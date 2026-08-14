@@ -188,7 +188,7 @@ proc main() =
       rss = ru.ru_maxrss
       flt = ru.ru_minflt
 
-  tp = Taskpool.new(numThreads = nthreads)
+  tp = Taskpool.new(numThreads = nthreads * 2)
 
   when not defined(windows):
     let start = wtime_msec()

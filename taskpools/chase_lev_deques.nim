@@ -153,7 +153,6 @@ proc push*[T](deque: var ChaseLevDeque[T], item: T, wasEmpty: var bool) =
   when defined(taskpoolsTsan):
     # TSan does not support atomic_thread_fence, see:
     # https://github.com/llvm/llvm-project/issues/52942
-    # https://github.com/google/sanitizers/issues/1352
     deque.bottom.store(b+1, moRelease)
   else:
     fence(moRelease)
@@ -207,6 +206,19 @@ proc steal*[T](deque: var ChaseLevDeque[T]): T =
     if not compareExchange(deque.top, t, t+1, moSequentiallyConsistent, moRelaxed):
       # Failed race.
       return default(T)
+
+when defined(taskpoolsDebugStall):
+  proc debugState*[T](
+      deque: var ChaseLevDeque[T]
+  ): tuple[top, bottom, capacity: int] =
+    ## Diagnostics only. Reads the raw indices with no ordering guarantees, so
+    ## the answer is a smear rather than a snapshot - good enough to tell
+    ## "this deque plainly held work" from "this deque was empty".
+    (
+      deque.top.load(moRelaxed),
+      deque.bottom.load(moRelaxed),
+      deque.buf.load(moRelaxed).capacity,
+    )
 
 {.pop.} # overflowChecks
 {.pop.} # raises: []

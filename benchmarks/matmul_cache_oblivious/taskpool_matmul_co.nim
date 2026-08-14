@@ -184,7 +184,7 @@ proc main() =
   # Staccato benches runtime init and exit as well
   let start = wtime_msec()
 
-  tp = Taskpool.new(numThreads = nthreads)
+  tp = Taskpool.new(numThreads = nthreads * 2)
   discard sync tp.spawn matmul(A, B, C, n, n, n, add = false)
   tp.shutdown()
 

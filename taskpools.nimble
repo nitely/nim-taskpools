@@ -48,6 +48,11 @@ proc runTests(args: string) =
   # Tests
   run args, "tests/test_all.nim"
 
+  # Regression test for the schedule/push lost wakeup. Kept out of test_all
+  # because it hangs rather than fails when the bug is back - run it under a
+  # timeout in CI.
+  run args, "tests/test_spawn_spin.nim"
+
 task test, "Run tests":
   for mode in ["", "-d:release", "-d:danger"]:
     runTests(mode)
@@ -69,6 +74,53 @@ proc runBenchs(args: string) =
 
   # TODO - generics in macro issue
   # run args, "benchmarks/matmul_cache_oblivious/taskpool_matmul_co.nim"
+
+const stressTests = [
+  "tests/stress/test_arm_flowvar_wakeup.nim",
+  "tests/stress/test_arm_backoff_wakeup.nim",
+  "tests/stress/test_arm_taskpool_wakeup.nim",
+  "tests/stress/test_spawn_spin.nim",
+]
+
+task test_stress, "Run the weak-memory (ARM) lost-wakeup stress tests":
+  # These hunt for lost wakeups in the flowvar completion handshake and in the
+  # EventCount. They only ever fail on weakly-ordered CPUs (aarch64): on x86 the
+  # `lock`-prefixed RMWs are full barriers and hide the missing store-load
+  # ordering. Each test is watchdogged, so a lost wakeup aborts the process
+  # instead of hanging the CI job.
+  #
+  # Every scenario is capped by both an iteration count and a 20s time budget,
+  # whichever comes first, so the wall time is ~7 scenarios x 20s regardless of
+  # the core count (a `Taskpool.new()` spawns one thread per core, so a
+  # count-only cap would take orders of magnitude longer on a big machine).
+  #
+  # When actually hunting on aarch64 hardware, raise the budget and loop the
+  # binaries: -d:tpStressBudgetMs:600_000. The window is a handful of cycles
+  # wide, so soak time is what finds it.
+  # Tune with -d:tpStressBudgetMs:N -d:tpStressIters:N -d:tpStressRounds:N
+  #           -d:tpStressTimeoutMs:N (watchdog stall threshold)
+  for path in stressTests:
+    run "-d:release -d:tpStressBudgetMs:60_000 -d:tpStressIters:50_000_000 -d:tpStressRounds:5_000_000", path
+
+task test_stress2, "Run shutdown test":
+  run "-d:release", "tests/stress/test_shutdown.nim"
+
+task test_stall, "Run the suite under the stall detector (hang hunting)":
+  # Builds everything with -d:taskpoolsDebugStall. A watchdog thread polls the
+  # live pools at 10Hz; if a pool is bit-identical with nobody running for
+  # taskpoolsStallSeconds it dumps per-worker phases + pending work and aborts,
+  # so a hang fails the job in seconds with a diagnosis instead of timing out.
+  #
+  # The instrumentation is deliberately I/O-free on the scheduler paths (see
+  # taskpools/instrumentation/stall_detector.nim): the whole point is to not
+  # perturb the timings that make the bug reproduce.
+  #
+  # Tune the threshold with -d:taskpoolsStallSeconds:N (default 30).
+  let stallFlags = " -d:taskpoolsDebugStall"
+  for mode in ["-d:release", "-d:danger"]:
+    run mode & stallFlags, "tests/test_all.nim"
+    run mode & stallFlags & " -d:taskpoolsGenericFutex", "tests/test_all.nim"
+  # run "-d:release" & stallFlags, "tests/stress/test_shutdown.nim"
 
 task test_bench, "Run benchs":
   for mode in ["", "-d:release", "-d:danger"]:

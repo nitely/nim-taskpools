@@ -95,6 +95,17 @@ proc cancelSleep*(ec: var EventCount) {.inline.} =
   ## Cancel a sleep that was scheduled.
   discard ec.waitset.fetchSub(kPreWait, moRelease)
 
+when defined(taskpoolsDebugStall):
+  # Read-only accessors. Deliberately no counters inside `wake()`: shared
+  # relaxed counters there bounce a cache line between every thread on every
+  # wake, and that perturbation alone was enough to make the hang stop
+  # reproducing.
+  func ticketEpoch*(t: ParkingTicket): uint32 {.inline.} =
+    t.epoch
+
+  proc debugEpoch*(ec: var EventCount): uint32 {.inline.} =
+    ec.events.load(moRelaxed)
+
 proc wake*(ec: var EventCount) {.inline.} =
   ## Prevent an idle thread from sleeping
   ## or wake a sleeping one if there wasn't any idle

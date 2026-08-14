@@ -6,7 +6,8 @@
 #   * Apache v2 license (license terms in the root directory or at http://www.apache.org/licenses/LICENSE-2.0).
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
-import std/atomics
+import std/[atomics, posix]
+import ./futex_checks
 export MemoryOrder
 
 # OS primitives
@@ -35,7 +36,13 @@ type
   Futex* = object
     value: Atomic[uint32]
 
+static:
+  # The kernel primitives compare a 32-bit word at the futex address; a padded
+  # or resized atomic would silently make them compare the wrong bytes.
+  doAssert sizeof(Atomic[uint32]) == 4, "the futex word must be exactly 32-bit"
+
 proc initialize*(futex: var Futex) {.inline.} =
+  checkFutexAlignment(futex.value.addr)
   futex.value.store(0, moRelaxed)
 
 proc teardown*(futex: var Futex) {.inline.} =
@@ -53,11 +60,24 @@ proc increment*(futex: var Futex, value: uint32, order: MemoryOrder): uint32 {.i
 
 proc wait*(futex: var Futex, expected: uint32) {.inline.} =
   ## Suspend a thread if the value of the futex is the same as expected.
-  discard ulock_wait(UL_COMPARE_AND_WAIT or ULF_NO_ERRNO, futex.value.addr, uint64 expected, 0)
+
+  # ULF_NO_ERRNO makes the call return -errno directly instead of setting errno.
+  # >= 0 is success (the count of remaining waiters). EINTR is a signal and
+  # normal. Anything else means the wait was rejected and we never parked, so
+  # the caller spins on its condition instead - see checkFutexAlignment.
+  let res {.used.} = ulock_wait(
+    UL_COMPARE_AND_WAIT or ULF_NO_ERRNO, futex.value.addr, uint64 expected, 0)
+  doAssert res >= 0 or res == -EINTR, "__ulock_wait failed unexpectedly " & $res
 
 proc wake*(futex: var Futex) {.inline.} =
   ## Wake one thread (from the same process)
-  discard ulock_wake(UL_COMPARE_AND_WAIT or ULF_NO_ERRNO, futex.value.addr, 0)
+
+  # -ENOENT just means nobody was parked, which is normal. Any other failure is
+  # a *silent* lost wakeup: the waiter stays parked and nothing retries a wake.
+  let res {.used.} = ulock_wake(
+    UL_COMPARE_AND_WAIT or ULF_NO_ERRNO, futex.value.addr, 0)
+  doAssert res >= 0 or res == -ENOENT,
+    "__ulock_wake failed - a parked thread will never be woken " & $res
 
 proc wakeAll*(futex: var Futex) {.inline.} =
   ## Wake all threads (from the same process)
