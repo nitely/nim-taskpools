@@ -161,8 +161,9 @@ proc free*(tn: var TaskNode) {.inline.} =
 
 proc `=copy`*[T](dst: var Flowvar[T], src: Flowvar[T]) {.error: "Futures/Flowvars cannot be copied".}
 
-proc `=wasMoved`*[T](obj: var Flowvar[T]) {.inline, noSideEffect.} =
-  obj.tn = nil
+when (NimMajor, NimMinor) >= (2, 2):
+  proc `=wasMoved`*[T](obj: var Flowvar[T]) {.inline.} =
+    obj.tn = nil
 
 proc newFlowVar*(T: typedesc, tn: TaskNode): Flowvar[T] {.inline.} =
   ## Create a Flowvar referencing `tn`. Must be called before the task node is
